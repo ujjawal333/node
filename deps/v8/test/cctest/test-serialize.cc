@@ -45,6 +45,7 @@
 #include "src/common/assert-scope.h"
 #include "src/debug/debug-coverage.h"
 #include "src/heap/heap-inl.h"
+#include "src/heap/heap-layout-inl.h"
 #include "src/heap/parked-scope-inl.h"
 #include "src/heap/read-only-heap.h"
 #include "src/heap/read-only-promotion.h"
@@ -6277,7 +6278,7 @@ void CheckObjectsAreInSharedHeap(Isolate* isolate) {
         heap->MustBeInSharedOldSpace(obj) ||
         (IsString(obj) && String::IsInPlaceInternalizable(Cast<String>(obj)));
     if (expected_in_shared_old) {
-      CHECK(InAnySharedSpace(obj));
+      CHECK(HeapLayout::InAnySharedSpace(obj));
     }
   }
 }
@@ -6288,6 +6289,9 @@ UNINITIALIZED_TEST(SharedStrings) {
   // shared Isolate.
 
   if (!V8_CAN_CREATE_SHARED_HEAP_BOOL) return;
+  // In multi-cage mode we create one cage per isolate
+  // and we don't share objects between cages.
+  if (COMPRESS_POINTERS_IN_MULTIPLE_CAGES_BOOL) return;
 
   // Make all the flags that require a shared heap false before creating the
   // isolate to serialize.

@@ -1761,7 +1761,7 @@ auto Func::call(const Val args[], Val results[]) const -> own<Trap> {
   PrepareFunctionData(isolate, function_data, sig, module);
   i::DirectHandle<i::Code> wrapper_code(function_data->c_wrapper_code(isolate),
                                         isolate);
-  i::Address call_target = function_data->internal()->call_target();
+  i::WasmCodePointer call_target = function_data->internal()->call_target();
 
   i::wasm::CWasmArgumentsPacker packer(function_data->packed_args_size());
   PushArgs(sig, args, &packer, store);
@@ -2066,7 +2066,8 @@ auto Table::make(Store* store_abs, const TableType* type, const Ref* ref)
 
   i::Handle<i::WasmTableObject> table_obj = i::WasmTableObject::New(
       isolate, i::Handle<i::WasmTrustedInstanceData>(), i_type, minimum,
-      has_maximum, maximum, isolate->factory()->null_value());
+      has_maximum, maximum, isolate->factory()->null_value(),
+      i::wasm::IndexType::kI32);
 
   if (ref) {
     i::DirectHandle<i::FixedArray> entries{table_obj->entries(), isolate};
@@ -2191,9 +2192,9 @@ auto Memory::make(Store* store_abs, const MemoryType* type) -> own<Memory> {
   }
   // TODO(wasm+): Support shared memory and memory64.
   i::SharedFlag shared = i::SharedFlag::kNotShared;
-  i::WasmMemoryFlag mem_type = i::WasmMemoryFlag::kWasmMemory32;
+  i::wasm::IndexType index_type = i::wasm::IndexType::kI32;
   i::Handle<i::WasmMemoryObject> memory_obj;
-  if (!i::WasmMemoryObject::New(isolate, minimum, maximum, shared, mem_type)
+  if (!i::WasmMemoryObject::New(isolate, minimum, maximum, shared, index_type)
            .ToHandle(&memory_obj)) {
     return own<Memory>();
   }

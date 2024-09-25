@@ -107,7 +107,9 @@
 #include "src/profiler/heap-profiler.h"
 #include "src/profiler/tracing-cpu-profiler.h"
 #include "src/regexp/regexp-stack.h"
+#include "src/roots/roots.h"
 #include "src/roots/static-roots.h"
+#include "src/sandbox/js-dispatch-table-inl.h"
 #include "src/snapshot/embedded/embedded-data-inl.h"
 #include "src/snapshot/embedded/embedded-file-writer-interface.h"
 #include "src/snapshot/read-only-deserializer.h"
@@ -139,10 +141,12 @@
 #endif  // V8_ENABLE_MAGLEV
 
 #if V8_ENABLE_WEBASSEMBLY
+#include "src/builtins/builtins-inl.h"
 #include "src/debug/debug-wasm-objects.h"
 #include "src/trap-handler/trap-handler.h"
 #include "src/wasm/stacks.h"
 #include "src/wasm/wasm-code-manager.h"
+#include "src/wasm/wasm-code-pointer-table-inl.h"
 #include "src/wasm/wasm-engine.h"
 #include "src/wasm/wasm-module.h"
 #include "src/wasm/wasm-objects.h"
@@ -487,6 +491,8 @@ size_t Isolate::HashIsolateForEmbeddedBlob() {
     static_assert(Code::kConstantPoolOffsetOffsetEnd + 1 ==
                   Code::kCodeCommentsOffsetOffset);
     static_assert(Code::kCodeCommentsOffsetOffsetEnd + 1 ==
+                  Code::kBuiltinJumpTableInfoOffsetOffset);
+    static_assert(Code::kBuiltinJumpTableInfoOffsetOffsetEnd + 1 ==
                   Code::kParameterCountOffset);
     static_assert(Code::kParameterCountOffsetEnd + 1 == Code::kBuiltinIdOffset);
     static_assert(Code::kBuiltinIdOffsetEnd + 1 == Code::kUnalignedSize);
@@ -503,8 +509,6 @@ size_t Isolate::HashIsolateForEmbeddedBlob() {
 
   return hash;
 }
-
-Isolate* Isolate::process_wide_shared_space_isolate_{nullptr};
 
 thread_local Isolate::PerIsolateThreadData* g_current_per_isolate_thread_data_
     V8_CONSTINIT = nullptr;
@@ -1305,6 +1309,7 @@ void VisitStack(Isolate* isolate, Visitor* visitor,
 #if V8_ENABLE_WEBASSEMBLY
       case StackFrame::STUB:
       case StackFrame::WASM:
+      case StackFrame::WASM_SEGMENT_START:
 #if V8_ENABLE_DRUMBRAKE
       case StackFrame::WASM_INTERPRETER_ENTRY:
 #endif  // V8_ENABLE_DRUMBRAKE
@@ -2173,6 +2178,23 @@ Tagged<Object> Isolate::UnwindAndFindHandler() {
   };
 
 #if V8_ENABLE_WEBASSEMBLY
+  auto HandleStackSwitch = [&](StackFrameIterator& iter) {
+    if (iter.wasm_stack() == nullptr) return;
+    auto switch_info = iter.wasm_stack()->stack_switch_info();
+    if (!switch_info.has_value()) return;
+    Tagged<Object> suspender_obj = root(RootIndex::kActiveSuspender);
+    if (!IsUndefined(suspender_obj)) {
+      // If the wasm-to-js wrapper was on a secondary stack and switched
+      // to the central stack, handle the implicit switch back.
+      if (switch_info->source_fp == iter.frame()->fp()) {
+        thread_local_top()->is_on_central_stack_flag_ = false;
+        stack_guard()->SetStackLimitForStackSwitching(
+            reinterpret_cast<uintptr_t>(iter.wasm_stack()->jslimit()));
+        iter.wasm_stack()->clear_stack_switch_info();
+      }
+    }
+  };
+
   Tagged<Object> maybe_continuation = root(RootIndex::kActiveContinuation);
   Tagged<WasmContinuationObject> continuation;
   if (!IsUndefined(maybe_continuation)) {
@@ -2341,7 +2363,8 @@ Tagged<Object> Isolate::UnwindAndFindHandler() {
       } break;
 #endif  // V8_ENABLE_DRUMBRAKE
 
-      case StackFrame::WASM: {
+      case StackFrame::WASM:
+      case StackFrame::WASM_SEGMENT_START: {
         if (!is_catchable_by_wasm(exception)) break;
 
         WasmFrame* wasm_frame = static_cast<WasmFrame*>(frame);
@@ -2386,27 +2409,7 @@ Tagged<Object> Isolate::UnwindAndFindHandler() {
         UNREACHABLE();
       }
       case StackFrame::WASM_TO_JS: {
-        Tagged<Object> suspender_obj = root(RootIndex::kActiveSuspender);
-        if (!IsUndefined(suspender_obj)) {
-          Tagged<WasmSuspenderObject> suspender =
-              Cast<WasmSuspenderObject>(suspender_obj);
-          // If the wasm-to-js wrapper was on a secondary stack and switched
-          // to the central stack, handle the implicit switch back.
-          Address central_stack_sp = *reinterpret_cast<Address*>(
-              frame->fp() +
-              WasmImportWrapperFrameConstants::kCentralStackSPOffset);
-          bool switched_stacks = central_stack_sp != kNullAddress;
-          if (switched_stacks) {
-            DCHECK_EQ(1, suspender->has_js_frames());
-            suspender->set_has_js_frames(0);
-            thread_local_top()->is_on_central_stack_flag_ = false;
-            Address secondary_stack_limit = Memory<Address>(
-                frame->fp() +
-                WasmImportWrapperFrameConstants::kSecondaryStackLimitOffset);
-            stack_guard()->SetStackLimitForStackSwitching(
-                secondary_stack_limit);
-          }
-        }
+        HandleStackSwitch(iter);
         break;
       }
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -2443,31 +2446,14 @@ Tagged<Object> Isolate::UnwindAndFindHandler() {
       }
 
       case StackFrame::STUB: {
+#if V8_ENABLE_WEBASSEMBLY
+        HandleStackSwitch(iter);
+#endif
         // Some stubs are able to handle exceptions.
         if (!catchable_by_js) break;
         StubFrame* stub_frame = static_cast<StubFrame*>(frame);
 #if V8_ENABLE_WEBASSEMBLY
-#if DEBUG
         DCHECK_NULL(wasm::GetWasmCodeManager()->LookupCode(this, frame->pc()));
-#endif
-        {
-          Tagged<Code> code = stub_frame->LookupCode();
-          if (code->builtin_id() == Builtin::kWasmToJsWrapperCSA) {
-            // If the wasm-to-js wrapper was on a secondary stack and switched
-            // to the central stack, handle the implicit switch back.
-            Address central_stack_sp = *reinterpret_cast<Address*>(
-                frame->fp() + WasmToJSWrapperConstants::kCentralStackSPOffset);
-            bool switched_stacks = central_stack_sp != kNullAddress;
-            if (switched_stacks) {
-              thread_local_top()->is_on_central_stack_flag_ = false;
-              Address secondary_stack_limit = Memory<Address>(
-                  frame->fp() +
-                  WasmToJSWrapperConstants::kSecondaryStackLimitOffset);
-              stack_guard()->SetStackLimitForStackSwitching(
-                  secondary_stack_limit);
-            }
-          }
-        }
 #endif  // V8_ENABLE_WEBASSEMBLY
 
         // The code might be a dynamically generated stub or a turbofanned
@@ -3568,15 +3554,6 @@ bool Isolate::IsWasmJSPIEnabled(Handle<NativeContext> context) {
 #endif
 }
 
-bool Isolate::IsWasmInliningEnabled(DirectHandle<NativeContext> context) {
-  // If Wasm GC is explicitly enabled via a callback, also enable inlining.
-#ifdef V8_ENABLE_WEBASSEMBLY
-  return v8_flags.experimental_wasm_inlining;
-#else
-  return false;
-#endif
-}
-
 bool Isolate::IsWasmImportedStringsEnabled(Handle<NativeContext> context) {
 #ifdef V8_ENABLE_WEBASSEMBLY
   v8::WasmImportedStringsEnabledCallback callback =
@@ -4034,11 +4011,10 @@ void Isolate::Delete(Isolate* isolate) {
   SetIsolateThreadLocals(saved_isolate, saved_data);
 }
 
-void Isolate::SetUpFromReadOnlyArtifacts(
-    std::shared_ptr<ReadOnlyArtifacts> artifacts, ReadOnlyHeap* ro_heap) {
+void Isolate::SetUpFromReadOnlyArtifacts(ReadOnlyArtifacts* artifacts,
+                                         ReadOnlyHeap* ro_heap) {
   if (ReadOnlyHeap::IsReadOnlySpaceShared()) {
     DCHECK_NOT_NULL(artifacts);
-    artifacts_ = artifacts;
     InitializeNextUniqueSfiId(artifacts->initial_next_unique_sfi_id());
   } else {
     DCHECK_NULL(artifacts);
@@ -4074,6 +4050,8 @@ Isolate::Isolate(IsolateGroup* isolate_group)
       cancelable_task_manager_(new CancelableTaskManager()) {
   TRACE_ISOLATE(constructor);
   CheckIsolateLayout();
+
+  isolate_group->IncrementIsolateCount();
 
   // ThreadManager is initialized early to support locking an isolate
   // before it is entered.
@@ -4112,6 +4090,15 @@ Isolate::Isolate(IsolateGroup* isolate_group)
     Address landing_pad =
         embedded_data.InstructionStartOf(Builtin::kWasmTrapHandlerLandingPad);
     i::trap_handler::SetLandingPad(landing_pad);
+  }
+  wasm::WasmCodePointerTable* wasm_code_pointer_table =
+      wasm::GetProcessWideWasmCodePointerTable();
+  for (size_t i = 0; i < Builtins::kNumWasmIndirectlyCallableBuiltins; i++) {
+    // TODO(sroettger): investigate if we can use a global set of handles for
+    // these builtins.
+    wasm_builtin_code_handles_[i] =
+        wasm_code_pointer_table->AllocateAndInitializeEntry(Builtins::EntryOf(
+            Builtins::kWasmIndirectlyCallableBuiltins[i], this));
   }
 #endif  // V8_ENABLE_WEBASSEMBLY
 
@@ -4180,6 +4167,10 @@ void Isolate::CheckIsolateLayout() {
   CHECK_EQ(static_cast<int>(
                OFFSET_OF(Isolate, isolate_data_.external_pointer_table_)),
            Internals::kIsolateExternalPointerTableOffset);
+
+  CHECK_EQ(static_cast<int>(OFFSET_OF(
+               Isolate, isolate_data_.shared_external_pointer_table_)),
+           Internals::kIsolateSharedExternalPointerTableAddressOffset);
 #endif
 #ifdef V8_ENABLE_SANDBOX
   CHECK_EQ(
@@ -4189,6 +4180,10 @@ void Isolate::CheckIsolateLayout() {
   CHECK_EQ(static_cast<int>(
                OFFSET_OF(Isolate, isolate_data_.trusted_pointer_table_)),
            Internals::kIsolateTrustedPointerTableOffset);
+
+  CHECK_EQ(static_cast<int>(
+               OFFSET_OF(Isolate, isolate_data_.shared_trusted_pointer_table_)),
+           Internals::kIsolateSharedTrustedPointerTableAddressOffset);
 #endif
   CHECK_EQ(static_cast<int>(
                OFFSET_OF(Isolate, isolate_data_.api_callback_thunk_argument_)),
@@ -4405,6 +4400,7 @@ void Isolate::Deinit() {
   DumpAndResetStats();
 
   heap_.TearDown();
+  ReadOnlyHeap::TearDown(this);
 
   delete inner_pointer_to_code_cache_;
   inner_pointer_to_code_cache_ = nullptr;
@@ -4485,6 +4481,15 @@ void Isolate::Deinit() {
 #ifdef V8_ENABLE_SANDBOX
   trusted_pointer_table().TearDownSpace(heap()->trusted_pointer_space());
   trusted_pointer_table().TearDown();
+  if (owns_shareable_data()) {
+    shared_trusted_pointer_table().TearDownSpace(
+        shared_trusted_pointer_space());
+    shared_trusted_pointer_table().TearDown();
+    delete isolate_data_.shared_trusted_pointer_table_;
+    isolate_data_.shared_trusted_pointer_table_ = nullptr;
+    delete shared_trusted_pointer_space_;
+    shared_trusted_pointer_space_ = nullptr;
+  }
 
   GetProcessWideCodePointerTable()->TearDownSpace(heap()->code_pointer_space());
 #endif  // V8_ENABLE_SANDBOX
@@ -4505,17 +4510,13 @@ void Isolate::SetIsolateThreadLocals(Isolate* isolate,
   g_current_per_isolate_thread_data_ = data;
 
 #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
-  if (isolate) {
-    V8HeapCompressionScheme::InitBase(isolate->cage_base());
+  V8HeapCompressionScheme::InitBase(isolate ? isolate->cage_base()
+                                            : kNullAddress);
+  IsolateGroup::set_current(isolate ? isolate->isolate_group() : nullptr);
 #ifdef V8_EXTERNAL_CODE_SPACE
-    ExternalCodeCompressionScheme::InitBase(isolate->code_cage_base());
-#endif  // V8_EXTERNAL_CODE_SPACE
-  } else {
-    V8HeapCompressionScheme::InitBase(kNullAddress);
-#ifdef V8_EXTERNAL_CODE_SPACE
-    ExternalCodeCompressionScheme::InitBase(kNullAddress);
-#endif  // V8_EXTERNAL_CODE_SPACE
-  }
+  ExternalCodeCompressionScheme::InitBase(isolate ? isolate->code_cage_base()
+                                                  : kNullAddress);
+#endif
 #endif  // V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
 
   if (isolate && isolate->main_thread_local_isolate()) {
@@ -4608,12 +4609,13 @@ Isolate::~Isolate() {
   delete default_microtask_queue_;
   default_microtask_queue_ = nullptr;
 
-  // The ReadOnlyHeap should not be destroyed when sharing without pointer
-  // compression as the object itself is shared.
-  if (read_only_heap_->IsOwnedByIsolate()) {
-    delete read_only_heap_;
-    read_only_heap_ = nullptr;
+#if V8_ENABLE_WEBASSEMBLY
+  wasm::WasmCodePointerTable* wasm_code_pointer_table =
+      wasm::GetProcessWideWasmCodePointerTable();
+  for (size_t i = 0; i < Builtins::kNumWasmIndirectlyCallableBuiltins; i++) {
+    wasm_code_pointer_table->FreeEntry(wasm_builtin_code_handles_[i]);
   }
+#endif
 
   // isolate_group_ released in caller, to ensure that all member destructors
   // run before potentially unmapping the isolate's VirtualMemoryArea.
@@ -4695,8 +4697,9 @@ void Isolate::NotifyExceptionPropagationCallback() {
     // "C++ -> JS" or "C++ -> Api callback" boundary.
     return;
   }
-  if (it.done() || (ext_callback_scope &&
-                    ext_callback_scope->scope_address() < it.frame()->fp())) {
+  if (it.done() ||
+      (ext_callback_scope &&
+       ext_callback_scope->JSStackComparableAddress() < it.frame()->fp())) {
     // There were no crossings of "C++ -> JS" boundary at all or they happened
     // earlier than the last crossing of the  "C++ -> Api callback" boundary.
     // In this case all the data about Api callback is available in the
@@ -4816,6 +4819,7 @@ void Isolate::NotifyExceptionPropagationCallback() {
       return;
 #if V8_ENABLE_WEBASSEMBLY
     case StackFrame::WASM:
+    case StackFrame::WASM_SEGMENT_START:
       // No more info.
       return;
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -5320,12 +5324,12 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
   Isolate* use_shared_space_isolate = nullptr;
 
   if (HasFlagThatRequiresSharedHeap()) {
-    if (process_wide_shared_space_isolate_) {
+    if (isolate_group_->has_shared_space_isolate()) {
       owns_shareable_data_ = false;
-      use_shared_space_isolate = process_wide_shared_space_isolate_;
+      use_shared_space_isolate = isolate_group_->shared_space_isolate();
     } else {
-      process_wide_shared_space_isolate_ = this;
-      use_shared_space_isolate = this;
+      isolate_group_->init_shared_space_isolate(this);
+      use_shared_space_isolate = isolate_group_->shared_space_isolate();
       is_shared_space_isolate_ = true;
       DCHECK(owns_shareable_data_);
     }
@@ -5543,6 +5547,20 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
 #ifdef V8_ENABLE_SANDBOX
   GetProcessWideCodePointerTable()->InitializeSpace(
       heap()->code_pointer_space());
+  if (owns_shareable_data()) {
+    isolate_data_.shared_trusted_pointer_table_ = new TrustedPointerTable();
+    shared_trusted_pointer_space_ = new TrustedPointerTable::Space();
+    shared_trusted_pointer_table().Initialize();
+    shared_trusted_pointer_table().InitializeSpace(
+        shared_trusted_pointer_space());
+  } else {
+    DCHECK(has_shared_space());
+    isolate_data_.shared_trusted_pointer_table_ =
+        shared_space_isolate()->isolate_data_.shared_trusted_pointer_table_;
+    shared_trusted_pointer_space_ =
+        shared_space_isolate()->shared_trusted_pointer_space_;
+  }
+
 #endif  // V8_ENABLE_SANDBOX
 #ifdef V8_ENABLE_LEAPTIERING
   GetProcessWideJSDispatchTable()->InitializeSpace(
@@ -5621,8 +5639,8 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
     StartupDeserializer startup_deserializer(this, startup_snapshot_data,
                                              can_rehash);
     startup_deserializer.DeserializeIntoIsolate();
-    InitializeBuiltinJSDispatchTable();
   }
+  InitializeBuiltinJSDispatchTable();
   if (DEBUG_BOOL) VerifyStaticRoots();
   load_stub_cache_->Initialize();
   store_stub_cache_->Initialize();
@@ -6703,11 +6721,13 @@ void Isolate::RunPromiseHook(PromiseHookType type, Handle<JSPromise> promise,
 
 void Isolate::OnAsyncFunctionSuspended(Handle<JSPromise> promise,
                                        Handle<JSPromise> parent) {
-  DCHECK_EQ(0, promise->async_task_id());
+  DCHECK(!promise->has_async_task_id());
   RunAllPromiseHooks(PromiseHookType::kInit, promise, parent);
   if (HasAsyncEventDelegate()) {
     DCHECK_NE(nullptr, async_event_delegate_);
-    promise->set_async_task_id(++async_task_count_);
+    current_async_task_id_ =
+        JSPromise::GetNextAsyncTaskId(current_async_task_id_);
+    promise->set_async_task_id(current_async_task_id_);
     async_event_delegate_->AsyncEventOccurred(debug::kDebugAwait,
                                               promise->async_task_id(), false);
   }
@@ -6740,8 +6760,10 @@ void Isolate::OnPromiseThen(DirectHandle<JSPromise> promise) {
         }
       }
       if (info->IsUserJavaScript() && action_type.IsJust()) {
-        DCHECK_EQ(0, promise->async_task_id());
-        promise->set_async_task_id(++async_task_count_);
+        DCHECK(!promise->has_async_task_id());
+        current_async_task_id_ =
+            JSPromise::GetNextAsyncTaskId(current_async_task_id_);
+        promise->set_async_task_id(current_async_task_id_);
         async_event_delegate_->AsyncEventOccurred(action_type.FromJust(),
                                                   promise->async_task_id(),
                                                   debug()->IsBlackboxed(info));
@@ -6755,7 +6777,7 @@ void Isolate::OnPromiseBefore(Handle<JSPromise> promise) {
   RunPromiseHook(PromiseHookType::kBefore, promise,
                  factory()->undefined_value());
   if (HasAsyncEventDelegate()) {
-    if (promise->async_task_id()) {
+    if (promise->has_async_task_id()) {
       async_event_delegate_->AsyncEventOccurred(
           debug::kDebugWillHandle, promise->async_task_id(), false);
     }
@@ -6766,7 +6788,7 @@ void Isolate::OnPromiseAfter(Handle<JSPromise> promise) {
   RunPromiseHook(PromiseHookType::kAfter, promise,
                  factory()->undefined_value());
   if (HasAsyncEventDelegate()) {
-    if (promise->async_task_id()) {
+    if (promise->has_async_task_id()) {
       async_event_delegate_->AsyncEventOccurred(
           debug::kDebugDidHandle, promise->async_task_id(), false);
     }
@@ -6962,6 +6984,7 @@ void Isolate::SetRAILMode(RAILMode rail_mode) {
 
 void Isolate::SetPriority(v8::Isolate::Priority priority) {
   priority_ = priority;
+  heap()->tracer()->UpdateCurrentEventPriority(priority_);
   if (priority_ == v8::Isolate::Priority::kBestEffort) {
     heap()->ActivateMemoryReducerIfNeeded();
   }
@@ -7424,25 +7447,40 @@ void DefaultWasmAsyncResolvePromiseCallback(
   CHECK(ret.IsJust() ? ret.FromJust() : isolate->IsExecutionTerminating());
 }
 
+// Mutex used to ensure that the dispatch table entries for builtins are only
+// initialized once.
+base::LazyMutex read_only_dispatch_entries_mutex_ = LAZY_MUTEX_INITIALIZER;
+
 void Isolate::InitializeBuiltinJSDispatchTable() {
 #ifdef V8_ENABLE_LEAPTIERING
-  for (JSBuiltinDispatchHandleRoot::Idx idx =
-           JSBuiltinDispatchHandleRoot::kFirst;
-       idx < JSBuiltinDispatchHandleRoot::kEnd;
-       idx = static_cast<JSBuiltinDispatchHandleRoot::Idx>(
-           static_cast<int>(idx) + 1)) {
-    Builtin builtin = JSBuiltinDispatchHandleRoot::to_builtin(idx);
-    Tagged<Code> code = builtins_.code(builtin);
-    DCHECK(code->entrypoint_tag() == CodeEntrypointTag::kJSEntrypointTag);
-    // TODO(olivf, 40931165): It might be more robust to get the static
-    // parameter count of this builtin.
-    JSDispatchHandle handle =
-        GetProcessWideJSDispatchTable()->AllocateAndInitializeEntry(
-            read_only_heap()->js_dispatch_table_space(),
-            code->parameter_count());
-    DCHECK(!GetProcessWideJSDispatchTable()->HasCode(handle));
-    GetProcessWideJSDispatchTable()->SetCode(handle, code);
-    builtin_dispatch_table()[idx] = handle;
+  // Ideally these entries would be created when the read only heap is
+  // initialized. However, since builtins are deserialized later, we need to
+  // patch it up here. Also, we need a mutex so the shared read only heaps space
+  // is not initialized multiple times. This must be blocking as no isolate
+  // should be allowed to proceed until the table is initialized.
+  base::MutexGuard guard(read_only_dispatch_entries_mutex_.Pointer());
+  auto jdt = GetProcessWideJSDispatchTable();
+  if (jdt->PreAllocatedEntryNeedsInitialization(
+          read_only_heap_->js_dispatch_table_space(),
+          builtin_dispatch_handle(JSBuiltinDispatchHandleRoot::Idx::kFirst))) {
+    JSDispatchTable::UnsealReadOnlySegmentScope unseal_scope(jdt);
+    for (JSBuiltinDispatchHandleRoot::Idx idx =
+             JSBuiltinDispatchHandleRoot::kFirst;
+         idx < JSBuiltinDispatchHandleRoot::kCount;
+         idx = static_cast<JSBuiltinDispatchHandleRoot::Idx>(
+             static_cast<int>(idx) + 1)) {
+      Builtin builtin = JSBuiltinDispatchHandleRoot::to_builtin(idx);
+      DCHECK(Builtins::IsIsolateIndependent(builtin));
+      Tagged<Code> code = builtins_.code(builtin);
+      DCHECK(code->entrypoint_tag() == CodeEntrypointTag::kJSEntrypointTag);
+      JSDispatchHandle handle = builtin_dispatch_handle(builtin);
+      // TODO(olivf, 40931165): It might be more robust to get the static
+      // parameter count of this builtin.
+      int parameter_count = code->parameter_count();
+      jdt->InitializePreAllocatedEntry(
+          read_only_heap_->js_dispatch_table_space(), handle, code,
+          parameter_count);
+    }
   }
 #endif
 }
